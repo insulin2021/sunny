@@ -1,0 +1,8 @@
+{
+  "name": "Secret Sun-Moonlight Diary",
+  "description": "A secure, beautiful, and AI-powered mobile secret diary for your private thoughts.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
