@@ -3,11 +3,13 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { DiaryEntry, AppView, MOODS } from './types';
 import PasscodeLock from './components/PasscodeLock';
 import Layout from './components/Layout';
+import PaperWriter from './components/PaperWriter';
 import { analyzeDiaryEntry } from './services/geminiService';
 import { encryptData, decryptData } from './services/cryptoService';
 
 const App: React.FC = () => {
   const [view, setView] = useState<AppView>(AppView.LOCK);
+  const [showPaperWriter, setShowPaperWriter] = useState(false);
   const [entries, setEntries] = useState<DiaryEntry[]>([]);
   const [currentEntry, setCurrentEntry] = useState<DiaryEntry | null>(null);
   const [isUnlocked, setIsUnlocked] = useState(false);
@@ -193,6 +195,11 @@ const App: React.FC = () => {
   const isBlobURL = window.location.href.startsWith('blob:');
   const qrTargetURL = manualURL || (isBlobURL ? '' : window.location.href);
 
+  // Show PaperWriter overlay
+  if (showPaperWriter) {
+    return <PaperWriter onBack={() => setShowPaperWriter(false)} />;
+  }
+
   return (
     <>
       {view === AppView.LIST && (
@@ -268,11 +275,21 @@ const App: React.FC = () => {
             )}
           </div>
 
-          <button 
+          {/* Diary new entry button */}
+          <button
             onClick={handleCreateNew}
             className="fixed bottom-8 right-8 w-14 h-14 bg-indigo-600 rounded-full shadow-lg shadow-indigo-600/40 flex items-center justify-center active:scale-90 transition-transform z-40"
           >
             <i className="fas fa-plus text-white text-xl"></i>
+          </button>
+
+          {/* Paper Writer button */}
+          <button
+            onClick={() => setShowPaperWriter(true)}
+            className="fixed bottom-8 left-8 w-14 h-14 bg-violet-700 rounded-full shadow-lg shadow-violet-700/40 flex items-center justify-center active:scale-90 transition-transform z-40"
+            title="자동 논문 작성기"
+          >
+            <i className="fas fa-scroll text-white text-xl"></i>
           </button>
         </Layout>
       )}
