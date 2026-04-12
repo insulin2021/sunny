@@ -1,12 +1,15 @@
 // ────────────────────────────────────────────────────────────
-// paperService.ts — 4-stage paper writing pipeline
-// Uses the Anthropic Messages API directly via fetch (browser-safe)
+// paperService.ts — 6-stage paper writing pipeline
+//   1. Outline Agent
+//   2. Writing Agent (per section, with [Ref] markers)
+//   3. Evidence Agent  → structured query plan + numbered CU placeholders
+//   4. PubMed fetch     (handled in UI via pubmedService)
+//   5. Rewriter Agent  → replaces [CU_N] with real PMID-backed citations
+//   6. Review Agent    → quality control
 // ────────────────────────────────────────────────────────────
 
-const ANTHROPIC_API_KEY = (
-  (typeof process !== 'undefined' && process.env?.ANTHROPIC_API_KEY) ||
-  ''
-);
+import type { PubMedArticle } from './pubmedService';
+
 const API_URL = 'https://api.anthropic.com/v1/messages';
 const MODEL = 'claude-opus-4-6';
 
@@ -27,17 +30,31 @@ export interface PaperOutline {
   visualizations: string[];
 }
 
-export interface RefMarker {
-  placeholder: string;
-  searchQuery: string;
-  neededType: '지지 논문' | '반대 논문' | '방법론적 근거' | '배경 이론';
-  explanation: string;
+// Evidence plan types ─────────────────────────────────────────
+
+export type CitationNeedType = '지지 논문' | '반대 논문' | '방법론적 근거' | '배경 이론';
+
+export interface ClaimPlan {
+  id: string;           // "cu_1", "cu_2" …
+  placeholder: string;  // "[CU_1]", "[CU_2]" …
+  text: string;         // the claim sentence this citation supports
+  searchQuery: string;  // primary English PubMed query
+  variants: string[];   // 1-2 alternate queries
+  neededType: CitationNeedType;
 }
 
-export interface CitationEnhancement {
-  refs: RefMarker[];
-  enhancedDraft: string;
+export interface SectionEvidencePlan {
+  sectionName: string;
+  claims: ClaimPlan[];
 }
+
+export interface EvidencePlan {
+  plans: SectionEvidencePlan[];
+  /** Section drafts with [Ref] replaced by numbered [CU_N] placeholders */
+  draftWithCU: Record<string, string>;
+}
+
+// Review types ────────────────────────────────────────────────
 
 export interface ReviewComment {
   type: 'logical_leap' | 'weak_evidence' | 'readability' | 'structural';
@@ -54,7 +71,7 @@ export interface ReviewResult {
 }
 
 // ────────────────────────────────────────────────────────────
-// Core streaming helper
+// Core streaming helper (raw fetch → SSE)
 // ────────────────────────────────────────────────────────────
 
 async function streamMessages(
@@ -97,31 +114,25 @@ async function streamMessages(
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split('\n');
     buffer = lines.pop() ?? '';
-
     for (const line of lines) {
       if (!line.startsWith('data: ')) continue;
       const data = line.slice(6).trim();
       if (data === '[DONE]') continue;
       try {
         const evt = JSON.parse(data);
-        if (
-          evt.type === 'content_block_delta' &&
-          evt.delta?.type === 'text_delta'
-        ) {
+        if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta') {
           const text: string = evt.delta.text;
           fullText += text;
           onChunk(text);
         }
       } catch {
-        // ignore parse errors on non-JSON lines
+        // non-JSON SSE lines — ignore
       }
     }
   }
-
   return fullText;
 }
 
@@ -134,7 +145,7 @@ export async function runOutlineAgent(
   onChunk: (text: string) => void,
   apiKey: string,
 ): Promise<PaperOutline> {
-  const systemPrompt = `당신은 세계적인 학술지의 편집장입니다. 연구자가 제공하는 데이터/가설/핵심 아이디어를 바탕으로 논문의 체계적인 아웃라인을 작성합니다.
+  const sys = `당신은 세계적인 학술지의 편집장입니다. 연구자가 제공하는 데이터/가설/핵심 아이디어를 바탕으로 논문의 체계적인 아웃라인을 작성합니다.
 
 반드시 다음 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이 순수 JSON만):
 {
@@ -151,17 +162,17 @@ export async function runOutlineAgent(
   "visualizations": ["Table 1: ...", "Figure 1: ...", "Figure 2: ..."]
 }`;
 
-  const fullText = await streamMessages(
-    systemPrompt,
+  const full = await streamMessages(
+    sys,
     `다음 연구 내용을 바탕으로 논문 아웃라인을 작성해주세요:\n\n${researchInput}`,
     4096,
     onChunk,
     apiKey,
   );
 
-  const jsonMatch = fullText.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error('아웃라인 JSON 파싱 실패. 응답: ' + fullText.slice(0, 300));
-  return JSON.parse(jsonMatch[0]) as PaperOutline;
+  const m = full.match(/\{[\s\S]*\}/);
+  if (!m) throw new Error('아웃라인 JSON 파싱 실패. 응답: ' + full.slice(0, 300));
+  return JSON.parse(m[0]) as PaperOutline;
 }
 
 // ────────────────────────────────────────────────────────────
@@ -176,14 +187,14 @@ export async function runWritingAgent(
   apiKey: string,
 ): Promise<string> {
   const sectionInfo = outline.sections.find(s => s.name === sectionName);
-  const systemPrompt = `당신은 학술 논문 전문 저술가입니다. 다음 규칙을 엄격히 지켜 섹션을 작성하세요:
+  const sys = `당신은 학술 논문 전문 저술가입니다. 다음 규칙을 엄격히 지켜 섹션을 작성하세요:
 1. 격식 있는 학술적 문체(Academic Tone)를 유지할 것
 2. 문장 간의 논리적 연결성(Cohesion)을 극대화할 것
-3. 인용이 필요한 주장 뒤에는 [Ref]를 명시할 것
+3. 인용이 필요한 주장 뒤에는 [Ref]를 명시할 것 (절대 논문을 지어내지 말 것)
 4. 섹션 제목은 포함하지 말 것 (본문만 작성)
 5. 600-1000 단어 분량으로 작성할 것`;
 
-  const userPrompt = `논문 제목: ${outline.title}
+  const user = `논문 제목: ${outline.title}
 
 **작성할 섹션:** ${sectionName}
 **핵심 주장:** ${sectionInfo?.keyArgument ?? ''}
@@ -196,63 +207,157 @@ ${researchInput}
 
 위 내용을 바탕으로 "${sectionName}" 섹션의 본문을 학술적 문체로 작성해주세요. 인용이 필요한 부분은 [Ref]로 표시하세요.`;
 
-  return await streamMessages(systemPrompt, userPrompt, 8192, onChunk, apiKey);
+  return streamMessages(sys, user, 8192, onChunk, apiKey);
 }
 
 // ────────────────────────────────────────────────────────────
-// Stage 3 — Citation Enhancement Agent
+// Stage 3 — Evidence Agent
+// Reads all section drafts, identifies [Ref] markers,
+// assigns numbered claim-unit IDs [CU_N], and generates
+// English PubMed search queries for each.
 // ────────────────────────────────────────────────────────────
 
-export async function runCitationAgent(
-  sectionName: string,
-  draftText: string,
+export async function runEvidenceAgent(
+  outline: PaperOutline,
+  sectionDrafts: Record<string, string>,
   keywords: string,
   onChunk: (text: string) => void,
   apiKey: string,
-): Promise<CitationEnhancement> {
-  const systemPrompt = `당신은 서지정보 전문가이자 문헌 정보 에이전트입니다. 초안에서 [Ref] 표시된 부분을 분석하여 각 위치에 필요한 인용 정보를 제안합니다.
+): Promise<EvidencePlan> {
+  const sys = `당신은 학술 논문의 실증 근거 수집 전문 에이전트입니다.
+초안에서 [Ref] 표시된 위치를 분석하여 각 주장에 필요한 PubMed 검색 쿼리를 생성합니다.
 
-반드시 다음 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이 순수 JSON만):
+**출력 규칙:**
+- 순수 JSON만 출력 (마크다운 코드블록 없이)
+- 검색 쿼리는 반드시 영어로 작성 (PubMed MeSH 용어 활용)
+- 각 [Ref]에는 고유한 번호 부여 (cu_1, cu_2, …)
+- draftWithCU에는 원본 초안에서 [Ref]를 [CU_N]으로 교체한 전체 텍스트 수록
+
+JSON 형식:
 {
-  "refs": [
+  "plans": [
     {
-      "placeholder": "[Ref_1]",
-      "searchQuery": "Google Scholar 검색 쿼리 (영어로)",
-      "neededType": "지지 논문",
-      "explanation": "이 위치에 어떤 성격의 논문이 필요한지 설명"
+      "sectionName": "서론",
+      "claims": [
+        {
+          "id": "cu_1",
+          "placeholder": "[CU_1]",
+          "text": "[Ref] 바로 앞 핵심 주장 문장 (한국어 원문)",
+          "searchQuery": "primary English PubMed query with MeSH terms",
+          "variants": ["alternative query 1", "alternative query 2"],
+          "neededType": "지지 논문"
+        }
+      ]
     }
   ],
-  "enhancedDraft": "원본 초안에서 각 [Ref]를 [Ref_N: 간략 설명]으로 교체한 전체 텍스트"
+  "draftWithCU": {
+    "서론": "[Ref]를 [CU_1], [CU_2]... 로 교체한 서론 전체 텍스트",
+    "연구 방법": "..."
+  }
 }
 
-neededType은 반드시 "지지 논문", "반대 논문", "방법론적 근거", "배경 이론" 중 하나여야 합니다.`;
+neededType은 반드시 "지지 논문", "반대 논문", "방법론적 근거", "배경 이론" 중 하나.`;
 
-  const userPrompt = `**섹션명:** ${sectionName}
+  const draftsText = outline.sections
+    .filter(s => !!sectionDrafts[s.name])
+    .map(s => `### ${s.name}\n${sectionDrafts[s.name]}`)
+    .join('\n\n---\n\n');
+
+  const user = `**논문 제목:** ${outline.title}
 **핵심 키워드:** ${keywords}
 
-**초안 텍스트:**
-${draftText}
+**섹션 초안들 (각 [Ref]에 번호 부여 필요):**
 
-위 초안에서 [Ref] 표시된 부분에 들어갈 인용 후보를 분석해주세요.
-- 2020년 이후 주요 논문들이 다뤘을 법한 내용을 추론
-- 각 [Ref] 위치에 어떤 성격의 논문이 필요한지 설명
-- 실제 검색에 사용할 구체적인 영어 쿼리 제공`;
+${draftsText}
 
-  const fullText = await streamMessages(systemPrompt, userPrompt, 6144, onChunk, apiKey);
+위 초안에서 모든 [Ref] 표시를 찾아 고유 번호(cu_1부터 순서대로)를 부여하고, 각 위치에 필요한 실제 PubMed 검색 쿼리를 생성해주세요.`;
 
-  const jsonMatch = fullText.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) {
-    return { refs: [], enhancedDraft: draftText };
+  const full = await streamMessages(sys, user, 8192, onChunk, apiKey);
+
+  const m = full.match(/\{[\s\S]*\}/);
+  if (!m) {
+    // Fallback: return an empty plan so the pipeline can continue
+    const emptyDrafts: Record<string, string> = {};
+    outline.sections.forEach(s => {
+      if (sectionDrafts[s.name]) emptyDrafts[s.name] = sectionDrafts[s.name];
+    });
+    return { plans: [], draftWithCU: emptyDrafts };
   }
   try {
-    return JSON.parse(jsonMatch[0]) as CitationEnhancement;
+    return JSON.parse(m[0]) as EvidencePlan;
   } catch {
-    return { refs: [], enhancedDraft: draftText };
+    const emptyDrafts: Record<string, string> = {};
+    outline.sections.forEach(s => {
+      if (sectionDrafts[s.name]) emptyDrafts[s.name] = sectionDrafts[s.name];
+    });
+    return { plans: [], draftWithCU: emptyDrafts };
   }
 }
 
 // ────────────────────────────────────────────────────────────
-// Stage 4 — Review Agent
+// Stage 5 — Rewriter Agent
+// Takes a section draft with [CU_N] placeholders and a map of
+// real fetched PubMed articles, and rewrites the section
+// using only the provided evidence.
+// ────────────────────────────────────────────────────────────
+
+export async function runRewriterAgent(
+  outline: PaperOutline,
+  sectionName: string,
+  draftWithCU: string,
+  claimPlans: ClaimPlan[],
+  claimArticles: Record<string, PubMedArticle[]>,
+  onChunk: (text: string) => void,
+  apiKey: string,
+): Promise<string> {
+  const sys = `당신은 실증 근거 기반 논문 섹션 재작성 전문가입니다.
+
+**절대 규칙 (반드시 준수):**
+1. 아래 "사용 가능한 근거" 목록에 있는 논문만 인용 가능합니다
+2. PMID, 저자명, 발행연도를 절대 변조하거나 새로 만들지 마세요
+3. 인용 형식: (저자표시, 연도) (PMID: XXXXXXXX)
+   예: (Park et al., 2023) (PMID: 36712345)
+4. [CU_N]에 해당하는 근거가 없으면 해당 주장을 근거 없이 서술하거나 삭제하세요
+5. 제공되지 않은 어떤 논문도 인용하지 마세요
+6. 학술적 문체와 원문의 논리 구조를 유지하세요`;
+
+  // Build evidence context
+  const evidenceLines: string[] = [];
+  for (const claim of claimPlans) {
+    const arts = claimArticles[claim.id] ?? [];
+    evidenceLines.push(`\n**${claim.placeholder}** — 주장: "${claim.text}"`);
+    evidenceLines.push(`필요 유형: ${claim.neededType}`);
+    if (arts.length === 0) {
+      evidenceLines.push('  ⚠️ 검색 결과 없음 — 이 자리표시자를 제거하거나 주장을 약화시키세요');
+    } else {
+      arts.forEach((art, i) => {
+        evidenceLines.push(`  ${i + 1}. ${art.citationFull}`);
+        evidenceLines.push(`     제목: ${art.title}`);
+        evidenceLines.push(`     저널: ${art.journal} (${art.pubYear})`);
+        if (art.abstract) {
+          evidenceLines.push(`     초록: ${art.abstract.slice(0, 300)}${art.abstract.length > 300 ? '…' : ''}`);
+        }
+      });
+    }
+  }
+
+  const user = `**논문 제목:** ${outline.title}
+**섹션명:** ${sectionName}
+
+**사용 가능한 근거 (PubMed 실제 논문):**
+${evidenceLines.join('\n')}
+
+**재작성할 초안 (${sectionName}):**
+${draftWithCU}
+
+위 초안에서 [CU_N] 자리표시자를 사용 가능한 근거 논문으로 교체하여 섹션을 재작성해주세요.
+섹션 제목 없이 본문만 출력하세요.`;
+
+  return streamMessages(sys, user, 8192, onChunk, apiKey);
+}
+
+// ────────────────────────────────────────────────────────────
+// Stage 6 — Review Agent
 // ────────────────────────────────────────────────────────────
 
 export async function runReviewAgent(
@@ -261,7 +366,7 @@ export async function runReviewAgent(
   onChunk: (text: string) => void,
   apiKey: string,
 ): Promise<ReviewResult> {
-  const systemPrompt = `당신은 엄격한 논문 리뷰어(Reviewer #2)입니다. 제출된 초안을 비판적으로 검토하여 구체적이고 실질적인 개선 의견을 제시합니다.
+  const sys = `당신은 엄격한 논문 리뷰어(Reviewer #2)입니다. 제출된 초안을 비판적으로 검토하여 구체적이고 실질적인 개선 의견을 제시합니다.
 
 반드시 다음 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이 순수 JSON만):
 {
@@ -280,64 +385,52 @@ export async function runReviewAgent(
   ]
 }
 
-type은 반드시 "logical_leap", "weak_evidence", "readability", "structural" 중 하나여야 합니다.`;
+type은 반드시 "logical_leap", "weak_evidence", "readability", "structural" 중 하나.`;
 
-  const userPrompt = `**논문 제목:** ${outline.title}
+  const user = `**논문 제목:** ${outline.title}
 
 **서론 핵심 주장:** ${outline.sections.find(s => s.name === '서론')?.keyArgument ?? ''}
 **결론 핵심 주장:** ${outline.sections.find(s => s.name === '결론')?.keyArgument ?? ''}
 
 **전체 초안:**
-${fullDraft.slice(0, 12000)}
+${fullDraft.slice(0, 14000)}
 
 위 초안을 비판적으로 검토해주세요:
-1. 논리적 비약이나 근거 부족한 문장 지적
-2. 가독성 문제 수정 제안
-3. 서론의 질문에 결론이 명확히 답하는지 평가
-4. 최소 5개 이상의 구체적인 개선 의견 제시`;
+1. 인용이 제대로 됐는지 확인 (PMID 없는 인용 지적)
+2. 논리적 비약이나 근거 부족한 문장 지적
+3. 가독성 문제 수정 제안
+4. 서론의 질문에 결론이 명확히 답하는지 평가
+5. 최소 5개 이상의 구체적인 개선 의견 제시`;
 
-  const fullText = await streamMessages(systemPrompt, userPrompt, 8192, onChunk, apiKey);
+  const full = await streamMessages(sys, user, 8192, onChunk, apiKey);
 
-  const jsonMatch = fullText.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) {
-    return {
-      overallScore: 0,
-      flowEvaluation: fullText,
-      comments: [],
-      revisedPassages: [],
-    };
-  }
+  const m = full.match(/\{[\s\S]*\}/);
+  if (!m) return { overallScore: 0, flowEvaluation: full, comments: [], revisedPassages: [] };
   try {
-    return JSON.parse(jsonMatch[0]) as ReviewResult;
+    return JSON.parse(m[0]) as ReviewResult;
   } catch {
-    return {
-      overallScore: 0,
-      flowEvaluation: fullText,
-      comments: [],
-      revisedPassages: [],
-    };
+    return { overallScore: 0, flowEvaluation: full, comments: [], revisedPassages: [] };
   }
 }
 
 // ────────────────────────────────────────────────────────────
 // Assemble final paper
+// Prefers rewrittenDrafts (with real citations) over raw drafts
 // ────────────────────────────────────────────────────────────
 
 export function assembleFinalPaper(
   outline: PaperOutline,
   sectionDrafts: Record<string, string>,
-  citationEnhancements: Record<string, CitationEnhancement>,
+  rewrittenDrafts: Record<string, string>,
 ): string {
   const lines: string[] = [];
-
   lines.push(`# ${outline.title}\n`);
   lines.push(`## 초록\n\n${outline.abstract}\n`);
 
   for (const section of outline.sections) {
     lines.push(`## ${section.name}\n`);
-    const enhanced = citationEnhancements[section.name];
-    const draft = enhanced?.enhancedDraft || sectionDrafts[section.name] || '';
-    lines.push(draft + '\n');
+    const body = rewrittenDrafts[section.name] || sectionDrafts[section.name] || '';
+    lines.push(body + '\n');
   }
 
   if (outline.visualizations.length > 0) {
