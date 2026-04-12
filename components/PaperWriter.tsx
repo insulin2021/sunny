@@ -13,6 +13,7 @@ import {
   ReviewComment,
 } from '../services/paperService';
 import { searchWithFallback, PubMedArticle } from '../services/pubmedService';
+import FigureLegendPanel from './FigureLegendPanel';
 import Layout from './Layout';
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -124,6 +125,9 @@ const PaperWriter: React.FC<Props> = ({ onBack }) => {
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('anthropic_api_key') || '');
   const [apiKeyInput, setApiKeyInput] = useState(apiKey);
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
+
+  // Top-level view (pipeline vs figure legend tab)
+  const [view, setView] = useState<'pipeline' | 'figures'>('pipeline');
 
   // Pipeline state ────────────────────────────────────────
   const [stage, setStage] = useState<Stage>(apiKey ? 'input' : 'apikey');
@@ -1034,23 +1038,63 @@ const PaperWriter: React.FC<Props> = ({ onBack }) => {
         ) : undefined
       }
     >
-      {VISIBLE_STAGES.includes(stage) && <StageIndicator />}
-
-      {statusMsg && !isLoading && (
-        <div className="mb-4 px-3 py-2 bg-slate-900 rounded-xl border border-slate-800 text-xs text-slate-400 flex items-center gap-2">
-          <i className="fas fa-circle-check text-green-400 text-[10px]"></i>
-          {statusMsg}
+      {/* Tab switcher — only visible after API key is set */}
+      {stage !== 'apikey' && (
+        <div className="flex gap-1 p-1 bg-slate-900 rounded-xl border border-slate-800 mb-4">
+          <button
+            onClick={() => setView('pipeline')}
+            className={`flex-1 py-2 rounded-lg text-xs font-medium transition-all flex items-center justify-center gap-1.5 ${
+              view === 'pipeline'
+                ? 'bg-violet-600 text-white'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <i className="fas fa-file-lines text-[10px]"></i>논문 작성
+          </button>
+          <button
+            onClick={() => setView('figures')}
+            className={`flex-1 py-2 rounded-lg text-xs font-medium transition-all flex items-center justify-center gap-1.5 ${
+              view === 'figures'
+                ? 'bg-violet-600 text-white'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <i className="fas fa-image text-[10px]"></i>그림 범례
+          </button>
         </div>
       )}
 
-      {stage === 'apikey'   && renderApiKey()}
-      {stage === 'input'    && renderInput()}
-      {stage === 'outline'  && renderOutline()}
-      {stage === 'writing'  && renderWriting()}
-      {stage === 'evidence' && renderEvidence()}
-      {stage === 'rewrite'  && renderRewrite()}
-      {stage === 'review'   && renderReview()}
-      {stage === 'done'     && renderDone()}
+      {/* Figure Legend tab */}
+      {view === 'figures' && stage !== 'apikey' && (
+        <FigureLegendPanel
+          apiKey={apiKey}
+          paperTitle={outline?.title}
+          sections={outline?.sections.map(s => s.name)}
+        />
+      )}
+
+      {/* Pipeline tab */}
+      {view === 'pipeline' && (
+        <>
+          {VISIBLE_STAGES.includes(stage) && <StageIndicator />}
+
+          {statusMsg && !isLoading && (
+            <div className="mb-4 px-3 py-2 bg-slate-900 rounded-xl border border-slate-800 text-xs text-slate-400 flex items-center gap-2">
+              <i className="fas fa-circle-check text-green-400 text-[10px]"></i>
+              {statusMsg}
+            </div>
+          )}
+
+          {stage === 'apikey'   && renderApiKey()}
+          {stage === 'input'    && renderInput()}
+          {stage === 'outline'  && renderOutline()}
+          {stage === 'writing'  && renderWriting()}
+          {stage === 'evidence' && renderEvidence()}
+          {stage === 'rewrite'  && renderRewrite()}
+          {stage === 'review'   && renderReview()}
+          {stage === 'done'     && renderDone()}
+        </>
+      )}
     </Layout>
   );
 };
